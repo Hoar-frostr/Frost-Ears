@@ -17,6 +17,9 @@ object MeizuiotTWS {
 
     private const val TAG = "MzfpHook"
 
+    /** 伪装用的魅族型号 id（与 MzfpDevice 构造里保持一致） */
+    private const val SPOOF_MODEL_ID = "e6878a"
+
     // 与蓝牙进程（BluetoothHook）约定的广播动作（品牌无关，见 TwsActions）
     private const val ACTION_BATTERY = TwsActions.ACTION_BATTERY
     private const val ACTION_DEVICE_INFO = TwsActions.ACTION_DEVICE_INFO
@@ -93,6 +96,9 @@ object MeizuiotTWS {
                                 if (model >= 0) {
                                     currentVivoModel = model
                                 }
+                                if (!mac.isNullOrEmpty()) {
+                                    ensureDbDevice(service, module, mac, name ?: currentVivoName)
+                                }
                             }
                         }
                         val filter = IntentFilter(ACTION_DEVICE_INFO)
@@ -111,11 +117,65 @@ object MeizuiotTWS {
     }
 
     // ========================================================================
+    // ========== 确保 Mzfp 设备表里有这条记录 ==========
+    // 原实现只做 update，表为空时永远命中 0 行；这里补一条记录出来。
+    // ========================================================================
+    private fun ensureDbDevice(context: Context, module: XposedModule, mac: String, name: String?) {
+        val uri = Uri.parse("content://com.meizu.meizuiot.provider.MzfpDevice/devices")
+        val exists = try {
+            context.contentResolver.query(uri, null, "address=?", arrayOf(mac), null)?.use {
+                it.count > 0
+            } ?: false
+        } catch (e: Throwable) {
+            false
+        }
+        if (exists) return
+
+        val values = ContentValues().apply {
+            val now = System.currentTimeMillis()
+            put("device_id", "fake_" + mac.replace(":", ""))
+            put("model_id", SPOOF_MODEL_ID)
+            put("token", "")
+            put("name", name ?: "MEIZU Earbuds")
+            put("address", mac)
+            put("bond_state", 2)
+            put("found_time", now)
+            put("show_time", now)
+            put("version", 16)
+            put("mask", 0x20)
+            put("apperance", 1)
+            put("box_bat", if (vivoBox >= 0) vivoBox else 0)
+            put("left_bat", if (vivoLeft >= 0) vivoLeft else 0)
+            put("right_bat", if (vivoRight >= 0) vivoRight else 0)
+        }
+
+        try {
+            context.contentResolver.insert(uri, values)
+            XLog.i(module, TAG, "ensureDbDevice: inserted $mac")
+        } catch (e: Throwable) {
+            // provider 不支持 insert 时直接写库兜底
+            try {
+                val db = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(
+                    context.getDatabasePath("mzfp_device.db"), null
+                )
+                db.insert("devices", null, values)
+                db.close()
+                XLog.i(module, TAG, "ensureDbDevice: direct insert $mac")
+            } catch (e2: Throwable) {
+                XLog.e(module, TAG, "ensureDbDevice failed", e2)
+            }
+        }
+    }
+
+    // ========================================================================
     // ========== 更新数据库里的电量 ==========
     // ========================================================================
     private fun updateDbBattery(context: Context, module: XposedModule) {
         try {
             val mac = currentVivoMac ?: return
+
+            // 表里没有这条设备时先补一行，否则下面的 update 会命中 0 行
+            ensureDbDevice(context, module, mac, currentVivoName)
 
             val values = ContentValues()
             if (vivoLeft >= 0) values.put("left_bat", vivoLeft)

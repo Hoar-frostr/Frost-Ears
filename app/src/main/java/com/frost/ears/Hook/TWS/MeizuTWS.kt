@@ -43,6 +43,43 @@ object MeizuTWS {
         hookRemotePrefService(module, param)
         hookSetAncSwitch(module, param)
         hookWearingStatus(module, param)
+        hookConnectionState(module, param)
+    }
+
+    // ========================================================================
+    // ========== 连接状态：让 fake_ 设备被判定为“已连接” ==========
+    // ========================================================================
+    private fun hookConnectionState(module: XposedModule, param: PackageReadyParam) {
+        val wrapperClassNames = listOf(
+            "com.meizu.earphone.audiodo.mzbluetooth.MzBluetoothWrapper",
+            "com.meizu.bluetooth.sdk.MzBluetoothManager",
+        )
+        for (className in wrapperClassNames) {
+            try {
+                val cls = param.classLoader.loadClass(className)
+
+                runCatching {
+                    val m = cls.getDeclaredMethod("isConnected", String::class.java)
+                    module.hook(m).intercept { chain ->
+                        val id = chain.args[0] as? String
+                        if (id != null && id.startsWith("fake_")) true else chain.proceed()
+                    }
+                }
+
+                runCatching {
+                    val m = cls.getDeclaredMethod("getConnectionState", String::class.java)
+                    module.hook(m).intercept { chain ->
+                        val id = chain.args[0] as? String
+                        // BluetoothProfile.STATE_CONNECTED
+                        if (id != null && id.startsWith("fake_")) 2 else chain.proceed()
+                    }
+                }
+
+                XLog.i(module, TAG, "hookConnectionState ok: $className")
+            } catch (e: Throwable) {
+                XLog.e(module, TAG, "hookConnectionState failed: $className", e)
+            }
+        }
     }
 
     // ========================================================================

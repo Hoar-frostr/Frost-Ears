@@ -3,7 +3,7 @@
 > 让第三方 TWS 耳机出现在魅族控制中心，本意只是为了快捷噪声控制
 
 基于 [libxposed](https://github.com/libxposed/api) API 102 的 LSPosed 模块。
-把 vivo / iQOO、原道 NiceHCK、等品牌的真无线耳机伪装成魅族官方设备，
+把 vivo / iQOO、原道 NiceHCK、HUAWEI FreeBuds 等品牌的真无线耳机伪装成魅族官方设备，
 让控制中心卡片、魅族耳机 App 能正常显示设备名、电量与降噪状态。
 
 <p align="center">
@@ -25,6 +25,7 @@
 |---|---|---|
 | vivo / iQOO | GAIA（RFCOMM） | vivo TWS 4 通过测试 |
 | 原道 NiceHCK / YUANDAO OriG in | NiceHCK 二进制 RFCOMM | YUANDAO OriG in 通过测试 |
+| HUAWEI FreeBuds / FreeClip / FreeLace | Huawei 5A SPP | FreeBuds 7i 通过测试 |
 
 > 新品牌只需在 `EarbudCatalog` 登记，并在 `BluetoothHook` 增加对应协议实现。
 

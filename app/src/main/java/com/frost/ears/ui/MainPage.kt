@@ -179,6 +179,11 @@ fun MainPage(
                                 title = "原道",
                                 summary = "YUANDAO OriG in 通过测试",
                             )
+                            HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                            BasicComponent(
+                                title = "HUAWEI",
+                                summary = "FreeBuds 7i 通过测试",
+                            )
                         }
                     }
 

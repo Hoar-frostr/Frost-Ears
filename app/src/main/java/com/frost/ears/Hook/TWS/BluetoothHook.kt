@@ -14,10 +14,11 @@ import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import com.frost.ears.utils.XLog
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 蓝牙进程 hook：注册广播、维护当前设备、按品牌协议常驻读循环（电量）+ 降噪写帧。
- * 支持的品牌协议：vivo（GAIA）、原道 OriG in（NiceHck 二进制 RFCOMM）。
+ * 支持的品牌协议：vivo（GAIA）、原道 OriG in（NiceHck 二进制 RFCOMM）、华为 FreeBuds（5A SPP）。
  * 品牌差异集中在 [ProtocolKind] 路由。
  */
 object BluetoothHook {
@@ -38,12 +39,26 @@ object BluetoothHook {
     // 常驻读循环参数
     private const val POLL_INTERVAL_MS = 30_000L   // 周期主动查电量间隔
     private const val READ_BUFFER_SIZE = 256
+    private const val INITIAL_CONNECT_DELAY_MS = 1_500L   // A2DP 连上后等耳机协商完再建私有连接
+    private const val CONNECT_BACKOFF_START_MS = 2_000L   // 建连失败退避起点
+    private const val CONNECT_BACKOFF_MAX_MS = 10_000L    // 建连失败退避上限
 
     /** 当前使用的品牌协议。 */
     private enum class ProtocolKind {
         GAIA,      // vivo / iQOO
         NICEHCK,   // 原道 OriG in
         HUAWEI,    // 华为 FreeBuds / FreeClip
+    }
+
+    /** RFCOMM 端点：固定 channel（免 SDP）或服务 UUID。 */
+    private sealed interface Endpoint {
+        data class Uuid(val uuid: String) : Endpoint {
+            override fun toString() = "uuid $uuid"
+        }
+
+        data class Channel(val number: Int) : Endpoint {
+            override fun toString() = "channel $number"
+        }
     }
     
     @Volatile private var poppedMac: String? = null
@@ -56,9 +71,8 @@ object BluetoothHook {
     @Volatile private var socket: BluetoothSocket? = null
     private val socketLock = Any()
 
-    // 常驻读循环状态
-    @Volatile private var readLoopActive = false
-    private val readLoopLock = Any()
+    // 读/写循环代际：连接、断开时自增，旧循环发现代际变了就自行退出，避免重连竞态
+    private val loopGen = AtomicInteger(0)
 
     fun hook(module: XposedModule, param: PackageReadyParam) {
         if (!module.getRemotePreferences("frost_tool_prefs").getBoolean("tws_device_spoof_enabled", false)) return
@@ -157,6 +171,7 @@ object BluetoothHook {
                         BluetoothProfile.STATE_DISCONNECTED,
                         BluetoothProfile.STATE_DISCONNECTING -> {
                             if (device == currentDevice) {
+                                loopGen.incrementAndGet()   // 旧会话的读/写循环立即失效
                                 currentDevice = null
                                 closeSocket()
                             }
@@ -203,52 +218,74 @@ object BluetoothHook {
     // ========== 常驻读循环 + 周期轮询（实时刷新电量） ==========
     // ========================================================================
     private fun startReadLoop(device: BluetoothDevice, protocol: ProtocolKind) {
-        synchronized(readLoopLock) {
-            if (readLoopActive) return
-            readLoopActive = true
-        }
-        // 写线程：周期主动查询电量（兜底）
+        val gen = loopGen.incrementAndGet()   // 新代际使旧读/写循环立即失效，不用等旧线程退出
+        closeSocket()                          // 清掉上一会话残留的 socket，从干净状态建连
+
+        // 写线程：周期主动查询电量（兜底）。只往已有连接写，建连统一由读线程负责。
         Thread {
-            while (readLoopActive && device == currentDevice) {
-                try {
-                    val sock = ensureSocket(device, protocol) ?: break
-                    try {
-                        sock.outputStream.write(batteryQuery(protocol))
-                        sock.outputStream.flush()
-                    } catch (e: Throwable) {
-                    }
-                } catch (e: Throwable) {
-                    module?.let { XLog.e(it, TAG, "poll failed", e) }
-                }
+            while (loopGen.get() == gen && device == currentDevice) {
                 try {
                     Thread.sleep(POLL_INTERVAL_MS)
                 } catch (e: InterruptedException) {
                     break
                 }
-            }
-        }.start()
-
-        // 读线程：解析电量上报并广播
-        Thread {
-            try {
-                val sock = ensureSocket(device, protocol) ?: return@Thread
-                val input = sock.inputStream
-                val buf = ByteArray(READ_BUFFER_SIZE)
+                if (loopGen.get() != gen || device != currentDevice) break
+                val sock = existingSocket() ?: continue
                 try {
                     sock.outputStream.write(batteryQuery(protocol))
                     sock.outputStream.flush()
                 } catch (e: Throwable) {
+                    closeSocket(gen)   // 写挂了：关掉，读线程会重连
                 }
-                val gaiaDecoder = GaiaProtocol.Decoder()
-                val niceDecoder = NiceHckProtocol.Decoder()
-                val huaweiDecoder = HuaweiProtocol.Decoder()
-                while (readLoopActive && device == currentDevice) {
+            }
+        }.start()
+
+        // 读线程：建连（失败退避重试）+ 解析电量上报并广播
+        Thread {
+            val buf = ByteArray(READ_BUFFER_SIZE)
+            var gaiaDecoder = GaiaProtocol.Decoder()
+            var niceDecoder = NiceHckProtocol.Decoder()
+            var huaweiDecoder = HuaweiProtocol.Decoder()
+            var lastSocket: BluetoothSocket? = null
+            var backoff = CONNECT_BACKOFF_START_MS
+            try {
+                // 刚连上时耳机在忙 A2DP/HFP 协商，稍等再建私有连接
+                try {
+                    Thread.sleep(INITIAL_CONNECT_DELAY_MS)
+                } catch (e: InterruptedException) {
+                    return@Thread
+                }
+                while (loopGen.get() == gen && device == currentDevice) {
+                    val sock = ensureSocket(device, protocol, gen)
+                    if (sock == null) {
+                        Thread.sleep(backoff)
+                        backoff = minOf(backoff * 2, CONNECT_BACKOFF_MAX_MS)
+                        continue
+                    }
+                    backoff = CONNECT_BACKOFF_START_MS
+                    if (sock !== lastSocket) {
+                        // 新连接（首次或重连）：解码器复位 + 立刻查一次电量
+                        lastSocket = sock
+                        gaiaDecoder = GaiaProtocol.Decoder()
+                        niceDecoder = NiceHckProtocol.Decoder()
+                        huaweiDecoder = HuaweiProtocol.Decoder()
+                        try {
+                            sock.outputStream.write(batteryQuery(protocol))
+                            sock.outputStream.flush()
+                        } catch (e: Throwable) {
+                            closeSocket(gen)
+                            continue
+                        }
+                    }
                     val n = try {
-                        input.read(buf)
+                        sock.inputStream.read(buf)
                     } catch (e: Throwable) {
                         -1
                     }
-                    if (n < 0) break
+                    if (n <= 0) {
+                        closeSocket(gen)   // 断流或异常：关掉重连，会话内自愈
+                        continue
+                    }
                     when (protocol) {
                         ProtocolKind.GAIA -> gaiaDecoder.offer(buf.copyOfRange(0, n))
                             .forEach { frame ->
@@ -270,10 +307,7 @@ object BluetoothHook {
             } catch (e: Throwable) {
                 module?.let { XLog.e(it, TAG, "read loop failed", e) }
             } finally {
-                synchronized(readLoopLock) {
-                    readLoopActive = false
-                }
-                closeSocket()
+                closeSocket(gen)
             }
         }.start()
     }
@@ -338,8 +372,9 @@ object BluetoothHook {
     // ========== 发送降噪模式 ==========
     // ========================================================================
     private fun sendNoiseMode(device: BluetoothDevice, protocol: ProtocolKind, mode: Int) {
+        val gen = loopGen.get()
         try {
-            val sock = ensureSocket(device, protocol) ?: return
+            val sock = ensureSocket(device, protocol, gen) ?: return
             val out = sock.outputStream
             when (protocol) {
                 ProtocolKind.GAIA -> {
@@ -384,40 +419,76 @@ object BluetoothHook {
             }
         } catch (e: Throwable) {
             module?.let { XLog.e(it, TAG, "sendNoiseMode failed", e) }
-            closeSocket()
+            closeSocket(gen)
         }
     }
 
     // ========================================================================
     // ========== RFCOMM socket 管理 ==========
     // ========================================================================
-    private fun ensureSocket(device: BluetoothDevice, protocol: ProtocolKind): BluetoothSocket? {
+    /**
+     * 建连并返回 socket；已有连接直接复用，失败清理后返回 null，由调用方退避重试。
+     * 建连前后都校验代际和当前设备，避免断开/切换后又把旧会话的连接建回来。
+     */
+    private fun ensureSocket(device: BluetoothDevice, protocol: ProtocolKind, gen: Int): BluetoothSocket? {
         synchronized(socketLock) {
-            var sock = socket
-            if (sock != null && sock.isConnected) return sock
+            if (loopGen.get() != gen || device != currentDevice) return null
+            socket?.let { return it }
 
-            val serviceUuid = when (protocol) {
-                ProtocolKind.GAIA -> "00000837-d102-11e1-9b23-00025b00a5a5"
-                ProtocolKind.NICEHCK -> NICEHCK_SPP_UUID
-                ProtocolKind.HUAWEI -> HUAWEI_SPP_UUID
-            }
-            return try {
-                sock = device.createRfcommSocketToServiceRecord(
-                    UUID.fromString(serviceUuid)
+            // 华为 FreeBuds 的 SDP 在重连时经常失败（耳机忙于 A2DP/HFP 协商），按上游实机结论
+            // 优先固定 channel 直连（免 SDP）：Pro 3 / FreeClip 用 1，FreeBuds 5i 用 16，
+            // 都不行再回落标准 SPP UUID。
+            val endpoints = when (protocol) {
+                ProtocolKind.GAIA -> listOf(Endpoint.Uuid("00000837-d102-11e1-9b23-00025b00a5a5"))
+                ProtocolKind.NICEHCK -> listOf(Endpoint.Uuid(NICEHCK_SPP_UUID))
+                ProtocolKind.HUAWEI -> listOf(
+                    Endpoint.Channel(1),
+                    Endpoint.Channel(16),
+                    Endpoint.Uuid(HUAWEI_SPP_UUID),
                 )
-                sock.connect()
-                socket = sock
-                sock
-            } catch (e: Throwable) {
-                module?.let { XLog.e(it, TAG, "connect failed", e) }
-                socket = null
-                null
             }
+            for (endpoint in endpoints) {
+                if (loopGen.get() != gen || device != currentDevice) return null
+                val sock = try {
+                    when (endpoint) {
+                        is Endpoint.Uuid -> device.createRfcommSocketToServiceRecord(
+                            UUID.fromString(endpoint.uuid)
+                        )
+                        is Endpoint.Channel -> device.javaClass
+                            .getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                            .invoke(device, endpoint.number) as BluetoothSocket
+                    }
+                } catch (e: Throwable) {
+                    module?.let { XLog.e(it, TAG, "create socket failed: $endpoint", e) }
+                    continue
+                }
+                try {
+                    sock.connect()
+                    if (loopGen.get() != gen || device != currentDevice) {
+                        try { sock.close() } catch (_: Throwable) {}
+                        return null
+                    }
+                    socket = sock
+                    module?.let { XLog.i(it, TAG, "SPP connected via $endpoint") }
+                    return sock
+                } catch (e: Throwable) {
+                    module?.let { XLog.e(it, TAG, "connect failed: $endpoint", e) }
+                    try { sock.close() } catch (_: Throwable) {}
+                }
+            }
+            return null
         }
     }
 
-    private fun closeSocket() {
+    /** 仅返回已建立的连接，不负责建连（建连统一由读线程做，避免多线程同时 connect）。 */
+    private fun existingSocket(): BluetoothSocket? {
+        synchronized(socketLock) { return socket }
+    }
+
+    /** 关闭当前 socket。传 gen 时仅当该代际仍是当前会话才关，避免旧线程误杀新会话的连接。 */
+    private fun closeSocket(gen: Int? = null) {
         synchronized(socketLock) {
+            if (gen != null && loopGen.get() != gen) return
             try {
                 socket?.close()
             } catch (e: Throwable) {
